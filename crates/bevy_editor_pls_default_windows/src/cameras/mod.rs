@@ -328,6 +328,62 @@ fn toggle_editor_cam(
     }
 }
 
+type FocusSelectedQuery<'a> = (
+    &'a GlobalTransform,
+    Option<&'a Aabb>,
+    Option<&'a Sprite>,
+    Option<&'a Children>,
+);
+
+fn get_bounds(e: Entity, query: &Query<FocusSelectedQuery, Without<ActiveEditorCamera>>) -> Aabb {
+    if let Ok((&tf, opt_aabb, opt_sprite, _)) = query.get(e) {
+        let transform =
+            |min: Vec3, max: Vec3| Aabb::from_min_max(tf * Vec3::from(min), tf * Vec3::from(max));
+
+        if let Some(aabb) = opt_aabb {
+            return transform(aabb.min().into(), aabb.max().into());
+        }
+
+        let point = Aabb::from_min_max(tf.translation, tf.translation);
+        if let Some(sprite) = opt_sprite {
+            return sprite.custom_size.map_or(point, |size| {
+                transform(
+                    Vec3::from((size * -0.5, 0.0)),
+                    Vec3::from((size * 0.5, 0.0)),
+                )
+            });
+        }
+        return point;
+    }
+    Aabb::default()
+}
+
+trait CombineBoundsExt {
+    fn combine_bounds(self) -> Aabb;
+}
+
+impl<T: Iterator<Item = Aabb>> CombineBoundsExt for T {
+    fn combine_bounds(self) -> Aabb {
+        self.fold(
+            Aabb::from_min_max(Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
+            |a, b| Aabb::from_min_max(a.min().min(b.min()).into(), a.max().max(b.max()).into()),
+        )
+    }
+}
+
+fn calculate_bounds_recursive(
+    e: Entity,
+    query: &Query<FocusSelectedQuery, Without<ActiveEditorCamera>>,
+) -> Aabb {
+    if let Ok(c) = query.get_component::<Children>(e) {
+        return c
+            .iter()
+            .map(|&c_e| calculate_bounds_recursive(c_e, query))
+            .combine_bounds();
+    }
+    get_bounds(e, query)
+}
+
 fn focus_selected(
     mut editor_events: EventReader<EditorEvent>,
     mut active_cam: Query<
@@ -338,83 +394,62 @@ fn focus_selected(
         ),
         With<ActiveEditorCamera>,
     >,
-    selected_query: Query<
-        (Entity, &GlobalTransform, Option<&Aabb>, Option<&Sprite>),
-        Without<ActiveEditorCamera>,
-    >,
+    selected_query: Query<FocusSelectedQuery, Without<ActiveEditorCamera>>,
     editor: Res<Editor>,
     windows: Res<Windows>,
 ) {
     for event in editor_events.iter() {
-        if let EditorEvent::FocusSelected = *event {
-            let hierarchy = editor.window_state::<HierarchyWindow>().unwrap();
-
-            if hierarchy.selected.is_empty() {
-                info!("Coudldn't focus on selection because selection is empty");
-                return;
-            }
-
-            let (bounds_min, bounds_max) = hierarchy
-                .selected
-                .iter()
-                .filter_map(|selected_e| {
-                    selected_query
-                        .iter()
-                        .find(|(query_e, _, _, _)| selected_e == *query_e)
-                        .map(|(_, &tf, bounds, sprite)| {
-                            let default_value = (tf.translation, tf.translation);
-                            let sprite_size = sprite
-                                .map(|s| s.custom_size.unwrap_or(Vec2::ONE))
-                                .map_or(default_value, |sprite_size| {
-                                    (
-                                        tf * Vec3::from((sprite_size * -0.5, 0.0)),
-                                        tf * Vec3::from((sprite_size * 0.5, 0.0)),
-                                    )
-                                });
-
-                            bounds.map_or(sprite_size, |bounds| {
-                                (tf * Vec3::from(bounds.min()), tf * Vec3::from(bounds.max()))
-                            })
-                        })
-                })
-                .fold(
-                    (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
-                    |(acc_min, acc_max), (min, max)| (acc_min.min(min), acc_max.max(max)),
-                );
-
-            const NO_BOUNDS_DISTANCE: f32 = 5.0;
-
-            let bounds_size = bounds_max - bounds_min;
-            let focus_loc = bounds_min + bounds_size * 0.5;
-            let distance_to_cam = if bounds_size.max_element() > f32::EPSILON {
-                bounds_size.length()
-            } else {
-                NO_BOUNDS_DISTANCE
-            };
-
-            let (mut camera_tf, pan_orbit_cam, ortho) = active_cam.single_mut();
-
-            if let Some(mut ortho) = ortho {
-                camera_tf.translation.x = focus_loc.x;
-                camera_tf.translation.y = focus_loc.y;
-
-                if let Some(w) = windows.get_primary() {
-                    ortho.scale = distance_to_cam / w.width().min(w.height()).max(1.0);
-                }
-            } else {
-                camera_tf.translation =
-                    focus_loc + camera_tf.rotation.mul_vec3(Vec3::Z) * distance_to_cam;
-            }
-
-            if let Some(mut pan_orbit_cam) = pan_orbit_cam {
-                pan_orbit_cam.focus = focus_loc;
-                pan_orbit_cam.radius = distance_to_cam;
-            }
-
-            let len = hierarchy.selected.len();
-            let noun = if len == 1 { "entity" } else { "entities" };
-            info!("Focused on {} {}", len, noun);
+        match *event {
+            EditorEvent::FocusSelected => (),
+            _ => continue,
         }
+
+        let hierarchy = editor.window_state::<HierarchyWindow>().unwrap();
+        if hierarchy.selected.is_empty() {
+            info!("Coudldn't focus on selection because selection is empty");
+            return;
+        }
+
+        let bounds = hierarchy
+            .selected
+            .iter()
+            .filter_map(|selected_e| {
+                selected_query
+                    .get(selected_e)
+                    .map(|_| calculate_bounds_recursive(selected_e, &selected_query))
+                    .ok()
+            })
+            .combine_bounds();
+
+        const RADIUS_MULTIPLIER: f32 = 4.0;
+
+        let focus_loc = Vec3::from(bounds.center);
+        let radius = if bounds.half_extents.max_element() > f32::EPSILON {
+            bounds.half_extents.length() * RADIUS_MULTIPLIER
+        } else {
+            RADIUS_MULTIPLIER
+        };
+
+        let (mut camera_tf, pan_orbit_cam, ortho) = active_cam.single_mut();
+        if let Some(mut ortho) = ortho {
+            camera_tf.translation.x = focus_loc.x;
+            camera_tf.translation.y = focus_loc.y;
+
+            if let Some(w) = windows.get_primary() {
+                ortho.scale = radius / w.width().min(w.height()).max(1.0);
+            }
+        } else {
+            camera_tf.translation = focus_loc + camera_tf.rotation.mul_vec3(Vec3::Z) * radius;
+        }
+
+        if let Some(mut pan_orbit_cam) = pan_orbit_cam {
+            pan_orbit_cam.focus = focus_loc;
+            pan_orbit_cam.radius = radius;
+        }
+
+        let len = hierarchy.selected.len();
+        let noun = if len == 1 { "entity" } else { "entities" };
+        info!("Focused on {} {}", len, noun);
     }
 }
 
